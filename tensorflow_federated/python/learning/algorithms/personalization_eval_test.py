@@ -227,16 +227,20 @@ def _build_personalize_fn(optimizer_fn, train_batch_size, test_batch_size):
 
     def train_fn(state, batch):
       """Runs gradient descent on a batch."""
-      opt_state, current_trainable, num_examples_sum = state
+      opt_state, current_trainable, current_non_trainable, num_examples_sum = (
+          state
+      )
       if isinstance(batch, Mapping):
         x = batch['x']
         y = batch['y']
       else:
         x, y = batch
-      current_weights = (current_trainable, non_trainable_weights)
+      current_weights = (current_trainable, current_non_trainable)
       with tf.GradientTape() as tape:
         tape.watch(current_trainable)
-        predictions = model.predict_on_batch(current_weights, x, training=True)
+        predictions, updated_non_trainable = model.forward_pass_on_batch(
+            current_weights, x, training=True
+        )
         loss = model.loss(output=predictions, label=y)
 
       grads = tape.gradient(loss, current_trainable)
@@ -247,22 +251,26 @@ def _build_personalize_fn(optimizer_fn, train_batch_size, test_batch_size):
       return (
           opt_state,
           updated_trainable,
+          updated_non_trainable,
           num_examples_sum + batch_num_examples,
       )
 
     # Train a personalized model.
     batched_train_data = train_data.batch(train_batch_size)
-    _, trained_trainable, num_examples_sum = dataset_reduce_fn(
-        reduce_fn=train_fn,
-        dataset=batched_train_data,
-        initial_state_fn=lambda: (
-            optimizer.initialize(trainable_specs),
-            trainable_weights,
-            tf.constant(0),
-        ),
+    _, trained_trainable, trained_non_trainable, num_examples_sum = (
+        dataset_reduce_fn(
+            reduce_fn=train_fn,
+            dataset=batched_train_data,
+            initial_state_fn=lambda: (
+                optimizer.initialize(trainable_specs),
+                trainable_weights,
+                non_trainable_weights,
+                tf.constant(0),
+            ),
+        )
     )
 
-    trained_weights = (trained_trainable, non_trainable_weights)
+    trained_weights = (trained_trainable, trained_non_trainable)
     results = collections.OrderedDict()
     results['num_examples'] = num_examples_sum
     results['test_outputs'] = _evaluate_fn(
