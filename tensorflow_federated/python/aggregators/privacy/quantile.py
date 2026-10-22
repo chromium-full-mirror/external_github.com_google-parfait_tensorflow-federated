@@ -22,6 +22,12 @@ from tensorflow_federated.python.aggregators.privacy import query
 from tensorflow_federated.python.aggregators.privacy import tree
 
 
+_ComposedDpEventNamedTuple = collections.namedtuple(
+    '_ComposedDpEventNamedTuple',
+    ['module_name', 'class_name', 'events'],
+)
+
+
 class QuantileEstimatorQuery(query.SumAggregationDPQuery):
   """DPQuery to estimate target quantile of a univariate distribution.
 
@@ -410,7 +416,18 @@ class QuantileAdaptiveClipSumQuery(query.SumAggregationDPQuery):
         new_quantile_estimator_state,
     )
 
-    event = dp_accounting.ComposedDpEvent(events=[sum_event, quantile_event])
+    if tf.executing_eagerly():
+      event = dp_accounting.ComposedDpEvent(events=[sum_event, quantile_event])
+    else:
+      # Cannot pass symbolic tensors to DpEvents.
+      event = _ComposedDpEventNamedTuple(
+          module_name=dp_accounting.ComposedDpEvent.__module__,
+          class_name=dp_accounting.ComposedDpEvent.__name__,
+          events=[
+              query.event_to_named_tuple(sum_event),
+              query.event_to_named_tuple(quantile_event),
+          ],
+      )
     return noised_vectors, new_global_state, event
 
   def derive_metrics(self, global_state):
@@ -563,7 +580,18 @@ class QAdaClipTreeResSumQuery(query.SumAggregationDPQuery):
     new_global_state = self._GlobalState(
         global_state.noise_multiplier, sum_state, quantile_estimator_state
     )
-    event = dp_accounting.ComposedDpEvent(events=[sum_event, quantile_event])
+    if tf.executing_eagerly():
+      event = dp_accounting.ComposedDpEvent(events=[sum_event, quantile_event])
+    else:
+      # Cannot pass symbolic tensors to DpEvents.
+      event = _ComposedDpEventNamedTuple(
+          module_name=dp_accounting.ComposedDpEvent.__module__,
+          class_name=dp_accounting.ComposedDpEvent.__name__,
+          events=[
+              query.event_to_named_tuple(sum_event),
+              query.event_to_named_tuple(quantile_event),
+          ],
+      )
     return noised_vectors, new_global_state, event
 
   def reset_state(self, noised_results, global_state):
