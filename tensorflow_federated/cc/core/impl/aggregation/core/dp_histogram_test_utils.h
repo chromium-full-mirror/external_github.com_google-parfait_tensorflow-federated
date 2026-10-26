@@ -25,13 +25,16 @@
 #include <vector>
 
 #include "googletest/include/gtest/gtest.h"
+#include "absl/container/fixed_array.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
 #include "tensorflow_federated/cc/core/impl/aggregation/base/monitoring.h"
 #include "tensorflow_federated/cc/core/impl/aggregation/core/agg_vector.h"
 #include "tensorflow_federated/cc/core/impl/aggregation/core/agg_vector_aggregator.h"
+#include "tensorflow_federated/cc/core/impl/aggregation/core/composite_key_combiner.h"
 #include "tensorflow_federated/cc/core/impl/aggregation/core/datatype.h"
+#include "tensorflow_federated/cc/core/impl/aggregation/core/domain_spec.h"
 #include "tensorflow_federated/cc/core/impl/aggregation/core/dp_exhaustive_report_histogram.h"
 #include "tensorflow_federated/cc/core/impl/aggregation/core/dp_fedsql_constants.h"
 #include "tensorflow_federated/cc/core/impl/aggregation/core/dp_thresholding_histogram.h"
@@ -60,6 +63,16 @@ class DPExhaustiveReportHistogramPeer {
   }
   absl::StatusOr<std::string> GetNoiseDescription() const {
     return dp_histogram_->GetNoiseDescription();
+  }
+  std::optional<int64_t> GetOrdinal(
+      TensorSpan domain_tensors,
+      const absl::FixedArray<int64_t>& indices) const {
+    CompositeKey key = dp_histogram_->MakeCompositeKeyFromDomainTensors(
+        domain_tensors, indices);
+    return dp_histogram_->key_combiner()->GetOrdinal(key);
+  }
+  OutputTensorList GetOutputKeys() const {
+    return dp_histogram_->key_combiner()->GetOutputKeys();
   }
 
  private:

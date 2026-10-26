@@ -16,6 +16,7 @@
 
 #include "tensorflow_federated/cc/core/impl/aggregation/core/dp_exhaustive_report_histogram.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -29,7 +30,7 @@
 #include "tensorflow_federated/cc/core/impl/aggregation/core/agg_core.pb.h"
 #include "tensorflow_federated/cc/core/impl/aggregation/core/composite_key_combiner.h"
 #include "tensorflow_federated/cc/core/impl/aggregation/core/datatype.h"
-#include "tensorflow_federated/cc/core/impl/aggregation/core/dp_composite_key_combiner.h"
+#include "tensorflow_federated/cc/core/impl/aggregation/core/domain_spec.h"
 #include "tensorflow_federated/cc/core/impl/aggregation/core/dp_fedsql_constants.h"
 #include "tensorflow_federated/cc/core/impl/aggregation/core/dp_group_by_aggregator.h"
 #include "tensorflow_federated/cc/core/impl/aggregation/core/dp_noise_mechanisms.h"
@@ -49,22 +50,23 @@ namespace aggregation {
 using differential_privacy::NumericalMechanism;
 
 namespace {
-// Given a tensor containing a column of aggregates and an ordinal, push the
-// aggregate associated with that ordinal to the back of a MutableVectorData
-// container. If the ordinal is kNoOrdinal, push 0 instead.
+// Given a tensor containing a column of aggregates and an optional ordinal,
+// push the aggregate associated with that ordinal to the back of a
+// MutableVectorData container. If the ordinal is std::nullopt, push 0 instead.
 // Adds noise if a mechanism is provided.
 template <typename T>
 void CopyAggregateFromColumn(const Tensor& column_of_aggregates,
-                             int64_t ordinal, MutableVectorData<T>& container,
+                             std::optional<int64_t> ordinal,
+                             MutableVectorData<T>& container,
                              NumericalMechanism* mechanism) {
   T zero = static_cast<T>(0);
   T noise_to_add =
       (mechanism == nullptr) ? zero : mechanism->AddNoise(/*result=*/zero);
 
   T value_to_push_back =
-      (ordinal == kNoOrdinal)
+      !ordinal.has_value()
           ? noise_to_add
-          : noise_to_add + column_of_aggregates.AsSpan<T>()[ordinal];
+          : noise_to_add + column_of_aggregates.AsSpan<T>()[*ordinal];
 
   // Add noisy value to the container.
   container.push_back(value_to_push_back);
@@ -174,6 +176,54 @@ bool DPExhaustiveReportHistogram::IncrementDomainIndices(
   return true;
 }
 
+CompositeKey DPExhaustiveReportHistogram::MakeCompositeKeyFromDomainTensors(
+    TensorSpan domain_tensors, const absl::FixedArray<int64_t>& indices) {
+  for (int64_t index : indices) {
+    TFF_CHECK(index >= 0)
+        << "DPExhaustiveReportHistogram::MakeCompositeKeyFromDomainTensors: "
+           "Indices must be non-negative.";
+  }
+
+  const std::vector<DataType>& dtypes = key_combiner()->dtypes();
+  size_t expected_num_keys = dtypes.size();
+  TFF_CHECK(domain_tensors.size() == expected_num_keys)
+      << "DPExhaustiveReportHistogram::MakeCompositeKeyFromDomainTensors: The "
+         "number of tensors in the output tensor list must match the number of "
+         "keys expected by the CompositeKeyCombiner.";
+  TFF_CHECK(indices.size() == expected_num_keys)
+      << "DPExhaustiveReportHistogram::MakeCompositeKeyFromDomainTensors: The "
+         "number of indices must match the number of keys expected by the "
+         "CompositeKeyCombiner.";
+
+  auto data_type_iter = dtypes.begin();
+  for (const Tensor& domain_tensor : domain_tensors) {
+    // Check that the data types of the input tensors match those provided to
+    // the constructor.
+    TFF_CHECK(*data_type_iter == domain_tensor.dtype())
+        << "DPExhaustiveReportHistogram::MakeCompositeKeyFromDomainTensors: "
+           "Data types must match. Got "
+        << domain_tensor.dtype() << " but expected " << *data_type_iter;
+    data_type_iter++;
+  }
+
+  auto index_iter = indices.begin();
+  data_type_iter = dtypes.begin();
+  CompositeKey composite_key = key_combiner()->storage().NewCompositeKey();
+  void* dest_ptr = composite_key.data();
+  for (const Tensor& domain_tensor : domain_tensors) {
+    // Copy over data from the current tensor at the given index.
+    const void* source_ptr = domain_tensor.data().data();
+    DTYPE_CASES(*data_type_iter, T,
+                key_combiner()->storage().IndexedCopyToDest<T>(
+                    source_ptr, *index_iter, dest_ptr));
+
+    // Advance the data-type and tensor iterators.
+    data_type_iter++;
+    index_iter++;
+  }
+  return composite_key;
+}
+
 StatusOr<OutputTensorList> DPExhaustiveReportHistogram::NoisyReport() {
   // Compute the noiseless aggregates.
   OutputTensorList noiseless_aggregates = std::move(*this).TakeOutputs();
@@ -242,10 +292,10 @@ StatusOr<OutputTensorList> DPExhaustiveReportHistogram::NoisyReport() {
         // The second batch of entries are the actual aggregates.
 
         // Get the ordinal for the composite key indexed by domain_indices
-        auto& dp_key_combiner =
-            dynamic_cast<DPCompositeKeyCombiner&>(*(key_combiner()));
-        int64_t ordinal =
-            dp_key_combiner.GetOrdinal(domain_tensors_, domain_indices);
+        CompositeKey composite_key =
+            MakeCompositeKeyFromDomainTensors(domain_tensors_, domain_indices);
+        std::optional<int64_t> ordinal =
+            key_combiner()->GetOrdinal(composite_key);
 
         // Get the current column of aggregates
         const Tensor& column_of_aggregates = noiseless_aggregates[i];

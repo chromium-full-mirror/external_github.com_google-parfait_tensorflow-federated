@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -225,6 +226,62 @@ TEST(CompositeKeyCombinerTest, LargeScale) {
   EXPECT_THAT(output[1], IsTensor<int64_t>({kNumElements}, int_data));
   EXPECT_THAT(output[2],
               IsTensor<string_view>({kNumElements}, string_view_data));
+}
+
+TEST(CompositeKeyCombinerTest, AccumulateAndGetOrdinal_NumericTypes) {
+  CompositeKeyCombiner combiner(
+      std::vector<DataType>{DT_FLOAT, DT_INT32, DT_INT64});
+  Tensor t1({1.1f, 1.2f, 1.3f});
+  Tensor t2({1, 2, 3});
+  Tensor t3({INT64_C(4), INT64_C(5), INT64_C(6)});
+  ASSERT_THAT(combiner.Accumulate(InputTensorList({&t1, &t2, &t3})),
+              IsOkAndHolds(IsTensor<int64_t>({0, 1, 2})));
+
+  auto make_key = [&](float f, int32_t i32, int64_t i64) {
+    CompositeKey key = combiner.storage().NewCompositeKey();
+    void* dest_ptr = key.data();
+    combiner.storage().CopyValueToDest<float>(f, dest_ptr);
+    combiner.storage().CopyValueToDest<int32_t>(i32, dest_ptr);
+    combiner.storage().CopyValueToDest<int64_t>(i64, dest_ptr);
+    return key;
+  };
+
+  EXPECT_EQ(combiner.GetOrdinal(make_key(0.0f, 2, 5)), std::nullopt);
+  EXPECT_EQ(combiner.GetOrdinal(make_key(1.1f, 1, 4)),
+            std::optional<int64_t>(0));
+  EXPECT_EQ(combiner.GetOrdinal(make_key(1.2f, 2, 5)),
+            std::optional<int64_t>(1));
+  EXPECT_EQ(combiner.GetOrdinal(make_key(1.3f, 3, 6)),
+            std::optional<int64_t>(2));
+}
+
+TEST(CompositeKeyCombinerTest, AccumulateAndGetOrdinal_StringTypes) {
+  auto storage = std::make_shared<CompositeKeyStorage>(
+      std::vector<DataType>{DT_FLOAT, DT_STRING, DT_STRING});
+  CompositeKeyCombiner combiner(
+      std::vector<DataType>{DT_FLOAT, DT_STRING, DT_STRING}, storage);
+  Tensor t1({1.1f, 1.2f, 1.3f});
+  Tensor t2({"abc", "de", ""});
+  Tensor t3({"fghi", "jklmn", "o"});
+  ASSERT_THAT(combiner.Accumulate(InputTensorList({&t1, &t2, &t3})),
+              IsOkAndHolds(IsTensor<int64_t>({0, 1, 2})));
+
+  auto make_key = [&](float f, string_view s1, string_view s2) {
+    CompositeKey key = storage->NewCompositeKey();
+    void* dest_ptr = key.data();
+    storage->CopyValueToDest<float>(f, dest_ptr);
+    storage->CopyValueToDest<string_view>(s1, dest_ptr);
+    storage->CopyValueToDest<string_view>(s2, dest_ptr);
+    return key;
+  };
+
+  EXPECT_EQ(combiner.GetOrdinal(make_key(0.0f, "de", "jklmn")), std::nullopt);
+  EXPECT_EQ(combiner.GetOrdinal(make_key(1.1f, "abc", "fghi")),
+            std::optional<int64_t>(0));
+  EXPECT_EQ(combiner.GetOrdinal(make_key(1.2f, "de", "jklmn")),
+            std::optional<int64_t>(1));
+  EXPECT_EQ(combiner.GetOrdinal(make_key(1.3f, "", "o")),
+            std::optional<int64_t>(2));
 }
 
 }  // namespace

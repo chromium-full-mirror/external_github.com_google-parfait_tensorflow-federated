@@ -19,8 +19,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <list>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -32,7 +34,9 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "tensorflow_federated/cc/core/impl/aggregation/base/monitoring.h"
+#include "tensorflow_federated/cc/core/impl/aggregation/core/datatype.h"
 #include "tensorflow_federated/cc/core/impl/aggregation/core/input_tensor_list.h"
 #include "tensorflow_federated/cc/core/impl/aggregation/core/mutable_vector_data.h"
 #include "tensorflow_federated/cc/core/impl/aggregation/core/tensor.h"
@@ -178,6 +182,90 @@ class CompositeKeyStore final {
 
 using InternPool = absl::node_hash_set<std::string>;
 
+// CompositeKeyStorage owns the backing memory for CompositeKeys, including the
+// fixed-size byte arena (CompositeKeyStore) and the string intern pool
+// (InternPool) for DT_STRING keys, and provides helpers to pack key elements
+// into a CompositeKey.
+class CompositeKeyStorage {
+ public:
+  explicit CompositeKeyStorage(absl::Span<const DataType> dtypes,
+                               size_t block_size_in_keys = 1024);
+  explicit CompositeKeyStorage(size_t key_size,
+                               size_t block_size_in_keys = 1024);
+
+  // CompositeKeyStorage is not copyable or moveable.
+  CompositeKeyStorage(const CompositeKeyStorage&) = delete;
+  CompositeKeyStorage& operator=(const CompositeKeyStorage&) = delete;
+  CompositeKeyStorage(CompositeKeyStorage&&) = delete;
+  CompositeKeyStorage& operator=(CompositeKeyStorage&&) = delete;
+
+  size_t key_size() const { return key_size_; }
+  InternPool& intern_pool() { return *intern_pool_; }
+  const std::shared_ptr<InternPool>& intern_pool_ptr() const {
+    return intern_pool_;
+  }
+
+  // Returns a CompositeKey pointing to the first available slot in the store.
+  // Multiple calls to NewCompositeKey() return keys that point to the same
+  // address unless AdvanceCompositeKey() is called.
+  inline CompositeKey NewCompositeKey() {
+    return composite_key_store_.CurrentKey();
+  }
+
+  // Advances the key to the next available slot.
+  inline void AdvanceCompositeKey(char* key_ptr) {
+    // Verify that the key points to the "current" key.
+    TFF_CHECK(key_ptr == composite_key_store_.CurrentKey().data());
+    // Advance the key address.
+    composite_key_store_.AdvanceKey();
+  }
+
+  // Copies `value` into the destination pointed to by `dest_ptr` and advances
+  // `dest_ptr` to the next element slot in the composite key.
+  template <typename T>
+  inline void CopyValueToDest(const T& value, void*& dest_ptr) {
+    std::memcpy(dest_ptr, &value, sizeof(T));
+    dest_ptr = static_cast<void*>(static_cast<uint8_t*>(dest_ptr) + sizeof(T));
+  }
+
+  // Copies the datum at `index` of the array pointed to by `source_ptr` into
+  // `dest_ptr` and advances `dest_ptr`.
+  template <typename T>
+  inline void IndexedCopyToDest(const void* source_ptr, size_t index,
+                                void*& dest_ptr) {
+    CopyValueToDest<T>(static_cast<const T*>(source_ptr)[index], dest_ptr);
+  }
+
+ private:
+  size_t key_size_;
+  std::shared_ptr<InternPool> intern_pool_;
+  CompositeKeyStore composite_key_store_;
+};
+
+// Specialization of CopyValueToDest for DT_STRING data type that interns the
+// string_view and copies the 64-bit address of the interned string to
+// `dest_ptr`.
+template <>
+inline void CompositeKeyStorage::CopyValueToDest<string_view>(
+    const string_view& value, void*& dest_ptr) {
+  // Insert the string into the intern pool if it does not already exist. This
+  // makes a copy of the string so that the intern pool owns the storage.
+  auto it = intern_pool_->emplace(value).first;
+  // The iterator of a node_hash_set may be invalidated by inserting more
+  // elements, but the pointer to the underlying element is guaranteed to be
+  // stable.
+  // Thus, get the address of the string after dereferencing the iterator.
+  const std::string* interned_string_ptr = &*it;
+  // The stable address of the string can be interpreted as a 64-bit integer.
+  intptr_t ptr_int = reinterpret_cast<intptr_t>(interned_string_ptr);
+  // Set the destination storage to the integer representation of the string
+  // address.
+  std::memcpy(dest_ptr, &ptr_int, sizeof(intptr_t));
+  // Advance the dest_ptr.
+  dest_ptr =
+      static_cast<void*>(static_cast<uint8_t*>(dest_ptr) + sizeof(intptr_t));
+}
+
 // Class operating on sets of tensors of the same shape to combine indices for
 // which the same combination of elements occurs, or in other words, indices
 // containing the same composite key.
@@ -211,6 +299,8 @@ class CompositeKeyCombiner {
 
   // Creates a CompositeKeyCombiner if inputs are valid or crashes otherwise.
   explicit CompositeKeyCombiner(std::vector<DataType> dtypes);
+  CompositeKeyCombiner(std::vector<DataType> dtypes,
+                       std::shared_ptr<CompositeKeyStorage> storage);
 
   // Returns a single tensor containing the ordinals of the composite keys
   // formed from the tensors in the InputTensorList.
@@ -245,8 +335,19 @@ class CompositeKeyCombiner {
   // this method.
   OutputTensorList GetOutputKeys() const;
 
+  // Returns the ordinal associated with `key`, or `std::nullopt` if `key` was
+  // not accumulated.
+  std::optional<int64_t> GetOrdinal(CompositeKey key) const;
+
   // Gets a reference to the expected types for this CompositeKeyCombiner.
   const std::vector<DataType>& dtypes() const { return dtypes_; }
+
+  // Accessor for the backing CompositeKeyStorage.
+  CompositeKeyStorage& storage() { return *storage_; }
+  const CompositeKeyStorage& storage() const { return *storage_; }
+  const std::shared_ptr<CompositeKeyStorage>& storage_ptr() const {
+    return storage_;
+  }
 
   // Checks that the provided InputTensorList can be accumulated into this
   // CompositeKeyCombiner.
@@ -270,33 +371,22 @@ class CompositeKeyCombiner {
       CompositeKeyMap& composite_key_map);
 
   // Functions to grant access to members
-  inline size_t GetCompositeKeySize() { return composite_key_size_; }
+  inline size_t GetCompositeKeySize() { return storage_->key_size(); }
   inline CompositeKeyMap& GetCompositeKeys() { return composite_keys_; }
-  inline InternPool& GetInternPool() { return *intern_pool_; }
+  inline InternPool& GetInternPool() { return storage_->intern_pool(); }
   // Creates a new composite key.
-  inline CompositeKey NewCompositeKey() {
-    return composite_key_store_.CurrentKey();
-  }
+  inline CompositeKey NewCompositeKey() { return storage_->NewCompositeKey(); }
   // Advances the key to the next available slot.
   inline void AdvanceCompositeKey(char* key_ptr) {
-    // Verify that the key points to the "current" key.
-    TFF_CHECK(key_ptr == composite_key_store_.CurrentKey().data());
-    // Advance the key address.
-    composite_key_store_.AdvanceKey();
+    storage_->AdvanceCompositeKey(key_ptr);
   }
 
  private:
   // The data types of the tensors in valid inputs to Accumulate, in this
   // exact order.
   std::vector<DataType> dtypes_;
-  // The size of the composite key in bytes.
-  size_t composite_key_size_;
-  // Set of unique strings encountered in tensors of type DT_STRING on calls
-  // to Accumulate. Used as an optimization to avoid storing the same string
-  // multiple times even if it appears in many composite keys.
-  std::shared_ptr<InternPool> intern_pool_;
-  // Composite key store.
-  CompositeKeyStore composite_key_store_;
+  // Backing storage for composite keys and interned strings.
+  std::shared_ptr<CompositeKeyStorage> storage_;
   // Mapping of composite keys to their ordinal.
   CompositeKeyMap composite_keys_;
 };

@@ -26,7 +26,7 @@
 #include "absl/status/statusor.h"
 #include "tensorflow_federated/cc/core/impl/aggregation/core/agg_core.pb.h"
 #include "tensorflow_federated/cc/core/impl/aggregation/core/composite_key_combiner.h"
-#include "tensorflow_federated/cc/core/impl/aggregation/core/dp_composite_key_combiner.h"
+#include "tensorflow_federated/cc/core/impl/aggregation/core/domain_spec.h"
 #include "tensorflow_federated/cc/core/impl/aggregation/core/dp_fedsql_constants.h"
 #include "tensorflow_federated/cc/core/impl/aggregation/core/dp_group_by_aggregator.h"
 #include "tensorflow_federated/cc/core/impl/aggregation/core/input_tensor_list.h"
@@ -56,6 +56,7 @@ class DPExhaustiveReportHistogram : public DPGroupByAggregator {
 
  protected:
   friend class DPGroupByFactory;
+  friend class DPExhaustiveReportHistogramPeer;
 
   // Create a DPExhaustiveReportHistogram.
   // This function is meant for use by the DPGroupByFactory; most callers
@@ -108,6 +109,11 @@ class DPExhaustiveReportHistogram : public DPGroupByAggregator {
   // [0, domain_tensors_[i].num_elements()]
   bool IncrementDomainIndices(absl::FixedArray<int64_t>& domain_indices,
                               int64_t which_key = 0);
+
+  // Given a span of tensors (where each describes a key's domain) and indices
+  // to tensor values, make a CompositeKey out of the data at those indices.
+  CompositeKey MakeCompositeKeyFromDomainTensors(
+      TensorSpan domain_tensors, const absl::FixedArray<int64_t>& indices);
 
   TensorSpan domain_tensors_;
 };
