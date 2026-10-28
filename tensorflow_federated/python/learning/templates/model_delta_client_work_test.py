@@ -659,6 +659,122 @@ class FunctionalModelDeltaClientWorkExecutionTest(
         output.measurements['train']['num_non_finite_clients'], num_clients
     )
 
+  @parameterized.named_parameters(
+      (
+          'dataset_iterator',
+          loop_builder.LoopImplementation.DATASET_ITERATOR,
+      ),
+      (
+          'dataset_reduce',
+          loop_builder.LoopImplementation.DATASET_REDUCE,
+      ),
+  )
+  def test_functional_client_update_advances_dropout_seed_across_batches(
+      self, loop_implementation
+  ):
+    num_batches = 3
+    feature_dim = 4
+    dropout_rate = 0.5
+    dropout_seed = 42
+    learning_rate = 0.1
+    dataset = tf.data.Dataset.from_tensor_slices((
+        np.ones([num_batches, feature_dim], dtype=np.float32),
+        np.zeros([num_batches, 1], dtype=np.float32),
+    )).batch(1)
+
+    def build_keras_model():
+      return keras.Sequential([
+          keras.layers.InputLayer(shape=(feature_dim,)),
+          keras.layers.Dropout(dropout_rate, seed=dropout_seed),
+          keras.layers.Dense(
+              1, kernel_initializer='ones', bias_initializer='zeros'
+          ),
+      ])
+
+    functional_model = functional.functional_model_from_keras(
+        build_keras_model(),
+        loss_fn=keras.losses.MeanSquaredError(),
+        input_spec=dataset.element_spec,
+    )
+
+    @tensorflow_computation.tf_computation
+    def client_update_functional(model_weights, data):
+      model_delta_fn = (
+          model_delta_client_work.build_functional_model_delta_update(
+              model=functional_model,
+              weighting=client_weight_lib.ClientWeighting.NUM_EXAMPLES,
+              loop_implementation=loop_implementation,
+          )
+      )
+      return model_delta_fn(
+          sgdm.build_sgdm(learning_rate=learning_rate), model_weights, data
+      )
+
+    client_update_variable = (
+        model_delta_client_work.build_model_delta_update_with_tff_optimizer(
+            model_fn=lambda: functional.model_from_functional(functional_model),
+            weighting=client_weight_lib.ClientWeighting.NUM_EXAMPLES,
+            loop_implementation=loop_implementation,
+        )
+    )
+    optimizer = sgdm.build_sgdm(learning_rate=learning_rate)
+    variable_weights = model_weights_lib.ModelWeights.from_model(
+        functional.model_from_functional(functional_model)
+    )
+    # Pass `ModelWeights` directly to verify that
+    # `build_functional_model_delta_update` unpacks `ModelWeights` containers
+    # under both `DATASET_ITERATOR` and `DATASET_REDUCE`.
+    functional_output, _ = client_update_functional(
+        model_weights_lib.ModelWeights(*functional_model.initial_weights),
+        dataset,
+    )
+    variable_output, _ = client_update_variable(
+        optimizer, variable_weights, dataset
+    )
+    self.assertAllClose(functional_output.update, variable_output.update)
+
+    # Verify the 3-batch delta differs from freezing the initial dropout mask
+    # across all 3 batches.
+    single_batch_ones = tf.ones([1, feature_dim], dtype=tf.float32)
+    first_preds, _ = functional_model.forward_pass_on_batch(
+        functional_model.initial_weights,
+        single_batch_ones,
+        training=True,
+    )
+    second_preds_frozen, _ = functional_model.forward_pass_on_batch(
+        functional_model.initial_weights,
+        single_batch_ones,
+        training=True,
+    )
+    self.assertAllClose(first_preds, second_preds_frozen)
+    # Compute what the 3-batch delta would have been if the non-trainable seed
+    # had remained frozen at `initial_weights[1]` on every batch.
+    frozen_trainable = tf.nest.map_structure(
+        tf.convert_to_tensor, functional_model.initial_weights[0]
+    )
+    frozen_opt_state = optimizer.initialize(
+        tf.nest.map_structure(tf.TensorSpec.from_tensor, frozen_trainable)
+    )
+    for x_batch, y_batch in dataset:
+      with tf.GradientTape() as tape:
+        tape.watch(frozen_trainable)
+        preds = functional_model.predict_on_batch(
+            (frozen_trainable, functional_model.initial_weights[1]),
+            x_batch,
+            training=True,
+        )
+        batch_loss = functional_model.loss(output=preds, label=y_batch)
+      grads = tape.gradient(batch_loss, frozen_trainable)
+      frozen_opt_state, frozen_trainable = optimizer.next(
+          frozen_opt_state, frozen_trainable, grads
+      )
+    frozen_delta = tf.nest.map_structure(
+        lambda a, b: a - b,
+        functional_model.initial_weights[0],
+        frozen_trainable,
+    )
+    self.assertNotAllClose(functional_output.update, frozen_delta)
+
 
 if __name__ == '__main__':
   cpp_execution_contexts.set_sync_local_cpp_execution_context()
